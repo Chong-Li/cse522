@@ -44,7 +44,21 @@
 #include <linux/aer.h>
 #include <linux/prefetch.h>
 
+#include <linux/wait.h>
+#include <linux/sched.h>
+#include <linux/kthread.h>
+#include <linux/syscalls.h>
+#include <linux/kernel.h>
+
+
 #include "e1000.h"
+
+#define NEW_NETDEV
+
+wait_queue_head_t net_recv_wq;
+struct task_struct *net_recv_task;
+int net_recv_flag;
+
 
 #define DRV_EXTRAVERSION "-k"
 
@@ -1276,6 +1290,7 @@ static bool e1000_clean_tx_irq(struct e1000_ring *tx_ring)
 		if (netif_queue_stopped(netdev) &&
 		    !(test_bit(__E1000_DOWN, &adapter->state))) {
 			netif_wake_queue(netdev);
+			DQL_flag=1;
 			++adapter->restart_queue;
 		}
 	}
@@ -1295,6 +1310,15 @@ static bool e1000_clean_tx_irq(struct e1000_ring *tx_ring)
 	}
 	adapter->total_tx_bytes += total_tx_bytes;
 	adapter->total_tx_packets += total_tx_packets;
+#ifdef NEW_NETDEV
+	for(i=0; i<3; i++){	
+		if(!list_empty(&(net_clean_wq[i].task_list))){			
+			if(BQL_flag==1&&DQL_flag==1){
+				wake_up(&net_clean_wq[i]);
+			}
+		}		
+	}
+#endif
 	return count < tx_ring->count;
 }
 
@@ -1808,6 +1832,16 @@ static irqreturn_t e1000_intr_msi(int __always_unused irq, void *data)
 		return IRQ_HANDLED;
 	}
 
+#ifdef NEW_NETDEV
+	adapter->total_tx_bytes = 0;
+	adapter->total_tx_packets = 0;
+	adapter->total_rx_bytes = 0;
+	adapter->total_rx_packets = 0;
+
+	net_recv_flag=1;
+	wake_up(&net_recv_wq);
+	
+#else
 	if (napi_schedule_prep(&adapter->napi)) {
 		adapter->total_tx_bytes = 0;
 		adapter->total_tx_packets = 0;
@@ -1815,6 +1849,8 @@ static irqreturn_t e1000_intr_msi(int __always_unused irq, void *data)
 		adapter->total_rx_packets = 0;
 		__napi_schedule(&adapter->napi);
 	}
+#endif
+	
 
 	return IRQ_HANDLED;
 }
@@ -2704,6 +2740,62 @@ static int e1000e_poll(struct napi_struct *napi, int weight)
 
 	return work_done;
 }
+
+int e1000_clean_action(struct e1000_adapter *data)
+{
+		//printk("e1000_clean_action\n");
+		struct e1000_adapter *adapter =data;
+		//int budget=net_batch_size;
+		int budget=64;
+		int work_done=0;
+		struct e1000_hw *hw = &adapter->hw;
+		struct net_device *poll_dev = adapter->netdev;
+		int tx_cleaned = 1;
+
+		adapter = netdev_priv(poll_dev);
+
+		if (adapter->msix_entries &&
+		    !(adapter->rx_ring->ims_val & adapter->tx_ring->ims_val))
+			goto clean_rx;
+
+		tx_cleaned = e1000_clean_tx_irq(adapter->tx_ring);
+		//net_recv_schedule();
+		
+
+	clean_rx:
+		//printk("clean_rx\n");
+		adapter->clean_rx(adapter->rx_ring, &work_done, budget); //e1000_clean_rx_irq
+		//e1000_clean_rx_irq( adapter, &work_done,budget);
+
+
+		if (!tx_cleaned){
+			work_done = budget;
+			napi_gro_flush(&adapter->napi, true);
+		}
+		
+		// If budget not fully consumed, exit the polling mode 
+		else if (work_done < budget) {
+			local_irq_disable();
+			net_recv_flag=0;
+			local_irq_enable();
+			napi_gro_flush(&adapter->napi, true);
+
+			/* ****************************************** */
+			if (adapter->itr_setting & 3)
+				e1000_set_itr(adapter);
+			if (!test_bit(__E1000_DOWN, &adapter->state)) {
+				if (adapter->msix_entries)
+					ew32(IMS, adapter->rx_ring->ims_val);
+				else
+					e1000_irq_enable(adapter);
+			}
+		}
+ 
+	return 0;
+}
+
+EXPORT_SYMBOL(e1000_clean_action);
+
 
 static int e1000_vlan_rx_add_vid(struct net_device *netdev,
 				 __always_unused __be16 proto, u16 vid)
@@ -4158,7 +4250,8 @@ int e1000e_up(struct e1000_adapter *adapter)
 	e1000_irq_enable(adapter);
 
 	netif_start_queue(adapter->netdev);
-
+	DQL_flag=1;
+	
 	/* fire a link change interrupt to start the watchdog */
 	if (adapter->msix_entries)
 		ew32(ICS, E1000_ICS_LSC | E1000_ICR_OTHER);
@@ -4586,7 +4679,8 @@ static int e1000_open(struct net_device *netdev)
 
 	adapter->tx_hang_recheck = false;
 	netif_start_queue(netdev);
-
+         DQL_flag=1;
+		 
 	hw->mac.get_link_status = true;
 	pm_runtime_put(&pdev->dev);
 
@@ -5663,6 +5757,7 @@ static int __e1000_maybe_stop_tx(struct e1000_ring *tx_ring, int size)
 	struct e1000_adapter *adapter = tx_ring->adapter;
 
 	netif_stop_queue(adapter->netdev);
+	DQL_flag=0;
 	/* Herbert's original patch had:
 	 *  smp_mb__after_netif_stop_queue();
 	 * but since that doesn't exist yet, just open code it.
@@ -5677,6 +5772,7 @@ static int __e1000_maybe_stop_tx(struct e1000_ring *tx_ring, int size)
 
 	/* A reprieve! */
 	netif_start_queue(adapter->netdev);
+	DQL_flag=1;
 	++adapter->restart_queue;
 	return 0;
 }
@@ -5811,7 +5907,6 @@ static netdev_tx_t e1000_xmit_frame(struct sk_buff *skb,
 		} else {
 			skb_tx_timestamp(skb);
 		}
-
 		netdev_sent_queue(netdev, skb->len);
 		e1000_tx_queue(tx_ring, tx_flags, count);
 		/* Make sure there is space in the ring for the next send. */
@@ -5853,7 +5948,9 @@ static void e1000_tx_timeout(struct net_device *netdev)
 
 	/* Do the reset outside of interrupt context */
 	adapter->tx_timeout_count++;
+#ifndef NEW_NETDEV
 	schedule_work(&adapter->reset_task);
+#endif
 }
 
 static void e1000_reset_task(struct work_struct *work)
@@ -6955,6 +7052,26 @@ static const struct net_device_ops e1000e_netdev_ops = {
 	.ndo_features_check	= passthru_features_check,
 };
 
+static int net_recv_kthread(void *data){
+	printk("~~~~~~~~~%s~~~~~~~~~\n", __func__);		
+	struct sched_param net_recv_param={.sched_priority=97};
+	sched_setscheduler_nocheck(net_recv_task,SCHED_FIFO,&net_recv_param);
+	struct e1000_adapter *adapter=data;
+	while (!kthread_should_stop()) {
+
+		wait_event_interruptible(net_recv_wq,
+				net_recv_flag||kthread_should_stop());
+		cond_resched();
+
+		if (kthread_should_stop())
+			break;
+		e1000_clean_action(adapter);
+	}
+	return 0;
+
+}
+
+
 /**
  * e1000_probe - Device Initialization Routine
  * @pdev: PCI device information struct
@@ -7277,6 +7394,22 @@ static int e1000_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	if (pci_dev_run_wake(pdev))
 		pm_runtime_put_noidle(&pdev->dev);
+	
+	printk("%s initiation\n", netdev->name);
+	NIC_dev=netdev;
+	BQL_flag=1;
+	DQL_flag=1;
+		
+	init_waitqueue_head(&net_recv_wq);
+	
+	net_recv_task=kthread_create(net_recv_kthread, (void *)adapter, "e1000e_recv/");
+		
+	if (IS_ERR(net_recv_task)) {
+		printk(KERN_ALERT "kthread_create() fails at e1000e/n");
+	}
+	
+	kthread_bind(net_recv_task,0);
+	wake_up_process(net_recv_task);
 
 	return 0;
 

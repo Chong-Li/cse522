@@ -51,6 +51,17 @@
 #include <linux/neighbour.h>
 #include <uapi/linux/netdevice.h>
 #include <uapi/linux/if_bonding.h>
+#include <linux/kernel.h>
+
+extern wait_queue_head_t net_clean_wq[3];
+extern struct net_device* NIC_dev;
+extern wait_queue_head_t net_recv_wq;
+
+extern int rx_clean_flag[3];
+
+extern int BQL_flag;
+extern int DQL_flag;
+
 
 struct netpoll_info;
 struct device;
@@ -2546,6 +2557,13 @@ struct softnet_data {
 	unsigned int		dropped;
 	struct sk_buff_head	input_pkt_queue;
 	struct napi_struct	backlog;
+	
+	//int input_pkt_nr;  
+	//struct sk_buff_head tx_queue[3];
+	//struct sk_buff_head rx_queue[3];
+	//u8 localdoms[20][ETH_ALEN];
+	//struct net_device *dev_queue[6];
+	//int dom_index;
 
 };
 
@@ -2717,6 +2735,7 @@ static inline void netdev_tx_sent_queue(struct netdev_queue *dev_queue,
 		return;
 
 	set_bit(__QUEUE_STATE_STACK_XOFF, &dev_queue->state);
+	BQL_flag=0;
 
 	/*
 	 * The XOFF flag must be set before checking the dql_avail below,
@@ -2726,8 +2745,10 @@ static inline void netdev_tx_sent_queue(struct netdev_queue *dev_queue,
 	smp_mb();
 
 	/* check again in case another CPU has just made room avail */
-	if (unlikely(dql_avail(&dev_queue->dql) >= 0))
+	if (unlikely(dql_avail(&dev_queue->dql) >= 0)) {
 		clear_bit(__QUEUE_STATE_STACK_XOFF, &dev_queue->state);
+		BQL_flag=1;
+	}
 #endif
 }
 
@@ -2764,6 +2785,8 @@ static inline void netdev_tx_completed_queue(struct netdev_queue *dev_queue,
 	if (dql_avail(&dev_queue->dql) < 0)
 		return;
 
+	if (BQL_flag==0)
+		BQL_flag=1;
 	if (test_and_clear_bit(__QUEUE_STATE_STACK_XOFF, &dev_queue->state))
 		netif_schedule_queue(dev_queue);
 #endif

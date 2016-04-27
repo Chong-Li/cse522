@@ -58,6 +58,8 @@ MODULE_PARM_DESC(copybreak,
  */
 E1000_PARAM(TxIntDelay, "Transmit Interrupt Delay");
 #define DEFAULT_TIDV 8
+//#define DEFAULT_TIDV 0
+
 #define MAX_TXDELAY 0xFFFF
 #define MIN_TXDELAY 0
 
@@ -67,6 +69,8 @@ E1000_PARAM(TxIntDelay, "Transmit Interrupt Delay");
  */
 E1000_PARAM(TxAbsIntDelay, "Transmit Absolute Interrupt Delay");
 #define DEFAULT_TADV 32
+//#define DEFAULT_TADV 0
+
 #define MAX_TXABSDELAY 0xFFFF
 #define MIN_TXABSDELAY 0
 
@@ -92,7 +96,7 @@ E1000_PARAM(RxAbsIntDelay, "Receive Absolute Interrupt Delay");
  * Valid Range: 100-100000 or one of: 0=off, 1=dynamic, 3=dynamic conservative
  */
 E1000_PARAM(InterruptThrottleRate, "Interrupt Throttling Rate");
-#define DEFAULT_ITR 3
+#define DEFAULT_ITR 0
 #define MAX_ITR 100000
 #define MIN_ITR 100
 

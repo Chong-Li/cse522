@@ -137,8 +137,35 @@
 #include <linux/errqueue.h>
 #include <linux/hrtimer.h>
 #include <linux/netfilter_ingress.h>
+#include <linux/kthread.h>
 
 #include "net-sysfs.h"
+
+#define NEW_DEV
+
+struct net_device *NIC_dev;
+EXPORT_SYMBOL(NIC_dev);
+
+wait_queue_head_t  net_clean_wq[3];
+EXPORT_SYMBOL(net_clean_wq);
+
+struct task_struct * net_clean_task[3];
+
+int rx_clean_flag[3];
+EXPORT_SYMBOL(rx_clean_flag);
+
+int BQL_flag;
+EXPORT_SYMBOL(BQL_flag);
+
+int DQL_flag;
+EXPORT_SYMBOL(DQL_flag);
+
+
+struct sk_buff_head tx_clean_queue[3];
+struct sk_buff_head rx_clean_queue[3];
+
+
+
 
 /* Instead of increasing this, you should create a hash table. */
 #define MAX_GRO_SKBS 8
@@ -3108,9 +3135,46 @@ static int __dev_queue_xmit(struct sk_buff *skb, void *accel_priv)
 		goto out;
 	}
 #endif
-
 	txq = netdev_pick_tx(dev, skb, accel_priv);
 	q = rcu_dereference_bh(txq->qdisc);
+	
+#ifdef NEW_DEV
+	struct ethhdr *eth_header=(struct ethhdr *)skb_mac_header(skb);
+	struct iphdr * ip_header=(struct iphdr *)((char *)eth_header+sizeof(struct ethhdr));
+	struct udphdr *udp_header=(struct udphdr *)((char *)ip_header+sizeof(struct iphdr));
+
+	int i;
+	if (udp_header->source > 24610 && udp_header->source < 27170)
+		i =0;
+	else if (udp_header->source > 27170 && udp_header->source < 29730)
+		i=1;
+	else if (udp_header->source > 29730 && udp_header->source < 32290)
+		i=2;
+	else
+		i=10;
+
+	
+	if (i<3) {
+		//if(i==0 )
+			//printk("%d %d %d %d\n", BQL_flag, DQL_flag, tx_clean_queue[0].qlen, tx_clean_queue[1].qlen);
+		if (BQL_flag==0||DQL_flag==0||tx_clean_queue[i].qlen>0){
+			if (tx_clean_queue[i].qlen>1000){
+				wake_up(&net_clean_wq[i]);
+				goto drop;
+			}
+			else {
+				spin_lock_irq(&tx_clean_queue[i].lock);
+				__skb_queue_tail(&tx_clean_queue[i], skb);
+				spin_unlock_irq(&tx_clean_queue[i].lock);
+				rc = NETDEV_TX_OK;
+				wake_up(&net_clean_wq[i]);
+				goto out;
+			}
+		}
+		skb = dev_hard_start_xmit(skb, dev, txq, &rc);
+		goto out;
+	}
+#endif
 
 #ifdef CONFIG_NET_CLS_ACT
 	skb->tc_verd = SET_TC_AT(skb->tc_verd, AT_EGRESS);
@@ -3533,7 +3597,7 @@ drop:
 static int netif_rx_internal(struct sk_buff *skb)
 {
 	int ret;
-
+	
 	net_timestamp_check(netdev_tstamp_prequeue, skb);
 
 	trace_netif_rx(skb);
@@ -3589,7 +3653,6 @@ EXPORT_SYMBOL(netif_rx);
 int netif_rx_ni(struct sk_buff *skb)
 {
 	int err;
-
 	trace_netif_rx_ni_entry(skb);
 
 	preempt_disable();
@@ -4013,6 +4076,7 @@ static int netif_receive_skb_internal(struct sk_buff *skb)
 	return ret;
 }
 
+
 /**
  *	netif_receive_skb - process receive buffer from network
  *	@skb: buffer to process
@@ -4332,10 +4396,50 @@ EXPORT_SYMBOL(gro_find_complete_by_type);
 
 static gro_result_t napi_skb_finish(gro_result_t ret, struct sk_buff *skb)
 {
+	int i;
+#ifdef NEW_DEV
+	struct ethhdr *eth_header=(struct ethhdr *)skb_mac_header(skb);
+	struct iphdr * ip_header=(struct iphdr *)((char *)eth_header+sizeof(struct ethhdr));
+	struct udphdr *udp_header=(struct udphdr *)((char *)ip_header+sizeof(struct iphdr));
+#endif
 	switch (ret) {
 	case GRO_NORMAL:
+#ifdef NEW_DEV
+		if (udp_header->dest > 24610 && udp_header->dest < 27170)
+			i =0;
+		else if (udp_header->dest > 27170 && udp_header->dest < 29730)
+			i=1;
+		else if (udp_header->dest > 29730 && udp_header->dest < 32290)
+			i=2;
+		else 
+			i=10;
+
+		if(i<3){
+
+			if(eth_header->h_proto!=htons(ETH_P_ARP)) {
+				if (rx_clean_queue[i].qlen>=1000)
+					kfree_skb(skb);
+				else{
+					spin_lock_irq(&rx_clean_queue[i].lock);
+					__skb_queue_tail(&rx_clean_queue[i], skb);
+					spin_unlock_irq(&rx_clean_queue[i].lock);
+					rx_clean_flag[i]=1;
+					wake_up(&net_clean_wq[i]);
+				}
+			}
+			else{
+				//net_timestamp_check(netdev_tstamp_prequeue, skb);
+				//skb_defer_rx_timestamp(skb);
+				//__netif_receive_skb(skb);
+				if (netif_receive_skb_internal(skb))
+				    ret = GRO_DROP;
+			}	
+			break;
+		}
+#endif
 		if (netif_receive_skb_internal(skb))
 			ret = GRO_DROP;
+		
 		break;
 
 	case GRO_DROP:
@@ -7731,6 +7835,57 @@ static struct pernet_operations __net_initdata default_device_ops = {
 	.exit_batch = default_device_exit_batch,
 };
 
+static void net_clean_kthread(void *data){
+
+	int index=*((int *)data);
+	struct sched_param net_clean_param={.sched_priority=(96-index)};
+	sched_setscheduler_nocheck(net_clean_task[index],SCHED_FIFO,&net_clean_param);
+	//struct net_device *dev=NIC_dev;
+	int rc;
+	struct netdev_queue *txq;
+	printk("net_clean_kthread %d starts\n", index);
+	while (!kthread_should_stop()) {
+
+		wait_event_interruptible(net_clean_wq[index],
+				 rx_clean_flag[index]||(tx_clean_queue[index].qlen>0 && BQL_flag && DQL_flag && NIC_dev!=NULL)  || kthread_should_stop());
+		cond_resched();
+
+		if (kthread_should_stop())
+			break;
+
+		while((tx_clean_queue[index].qlen>0 && BQL_flag && DQL_flag && NIC_dev!=NULL) || rx_clean_queue[index].qlen>0){
+			
+			struct sk_buff *skb;
+
+			if (tx_clean_queue[index].qlen > 0 && BQL_flag && DQL_flag && NIC_dev!=NULL) {
+				txq= netdev_get_tx_queue(NIC_dev, 0);
+				spin_lock_irq(&tx_clean_queue[index].lock);
+				skb=__skb_dequeue(&tx_clean_queue[index]);
+				spin_unlock_irq(&tx_clean_queue[index].lock);
+				
+				rcu_read_lock_bh();
+				skb = dev_hard_start_xmit(skb, NIC_dev, txq, &rc);
+				rcu_read_unlock_bh();
+				if ((rc == NETDEV_TX_BUSY ||(BQL_flag==0 && DQL_flag==0))&&skb){
+					spin_lock_irq(&tx_clean_queue[index].lock);
+					__skb_queue_head(&tx_clean_queue[index], skb);
+					spin_unlock_irq(&tx_clean_queue[index].lock);
+				}
+			} else if (rx_clean_queue[index].qlen>0) {
+				spin_lock_irq(&rx_clean_queue[index].lock);
+				skb=__skb_dequeue(&rx_clean_queue[index]);
+				spin_unlock_irq(&rx_clean_queue[index].lock);
+
+				netif_receive_skb_internal(skb);
+			}
+		}
+out:
+		rx_clean_flag[index]=0;
+	}
+
+}
+
+
 /*
  *	Initialize the DEV module. At boot time this walks the device list and
  *	unhooks any devices that fail to initialise (normally hardware not
@@ -7782,6 +7937,21 @@ static int __init net_dev_init(void)
 
 		sd->backlog.poll = process_backlog;
 		sd->backlog.weight = weight_p;
+	}
+	int j;
+	int cast[3];
+	for (j=0; j<3; j++){
+		skb_queue_head_init(&tx_clean_queue[j]);
+		skb_queue_head_init(&rx_clean_queue[j]);
+		init_waitqueue_head(&net_clean_wq[j]);
+		rx_clean_flag[j]=0;
+		cast[j]=j;
+		net_clean_task[j]=kthread_create(net_clean_kthread, (void *) (&cast[j]), "net_clean_task/%u", j);
+		if (IS_ERR(net_clean_task[j])) {
+			printk(KERN_ALERT "kthread_create() fails at net_clean/n");
+		}
+		kthread_bind(net_clean_task[j], 0);
+		wake_up_process(net_clean_task[j]);
 	}
 
 	dev_boot_phase = 0;
